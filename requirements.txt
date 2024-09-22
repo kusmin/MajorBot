@@ -6,3 +6,4 @@ Pyrogram==2.0.106
 better-proxy==1.1.5
 pydantic==2.6.4
 pydantic-settings==2.2.1
+TgCrypto
