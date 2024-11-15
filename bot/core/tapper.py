@@ -7,20 +7,31 @@ from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
 from pyrogram import Client
 from pyrogram.errors import Unauthorized, UserDeactivated, AuthKeyUnregistered, FloodWait
-from pyrogram.raw.functions.messages import RequestAppWebView
-from pyrogram.raw.functions import account
+from pyrogram.raw.functions import account, messages
 import time
+import re
 import json
 from pyrogram.raw.types import InputBotAppShortName, InputNotifyPeer, InputPeerNotifySettings
 from .agents import generate_random_user_agent
 from bot.config import settings
-from pyrogram.errors import UsernameNotOccupied
 from typing import Callable
 import functools
 from bot.utils import logger
 from bot.exceptions import InvalidSession
 from .headers import headers
 
+
+global_answers = {}
+
+async def update_answers_periodically():
+    global global_answers
+    while True:
+        with open('answers.json', 'r') as file:
+            global_answers = json.load(file)
+        await asyncio.sleep(7200)  # Sleep for 2 hours
+
+async def initialize_background_tasks():
+    asyncio.create_task(update_answers_periodically())
 
 def error_handler(func: Callable):
     @functools.wraps(func)
@@ -76,7 +87,7 @@ class Tapper:
             
             ref_id = settings.REF_ID if random.randint(0, 100) <= 85 else "339631649"
             
-            web_view = await self.tg_client.invoke(RequestAppWebView(
+            web_view = await self.tg_client.invoke(messages.RequestAppWebView(
                 peer=peer,
                 app=InputBotAppShortName(bot_id=peer, short_name="start"),
                 platform='android',
@@ -105,48 +116,51 @@ class Tapper:
             await asyncio.sleep(delay=3)
             return None, None
         
-        
     @error_handler
     async def join_and_mute_tg_channel(self, link: str):
         await asyncio.sleep(delay=random.randint(15, 30))
         
         if not self.tg_client.is_connected:
             await self.tg_client.connect()
-            
-        parsed_link = link if 'https://t.me/+' in link else link[13:]
+
         try:
+            parsed_link = link if 'https://t.me/+' in link else link[13:]
+            
+            chat = await self.tg_client.get_chat(parsed_link)
+            
+            if chat.username:
+                chat_username = chat.username
+            elif chat.id:
+                chat_username = chat.id
+            else:
+                logger.info("Unable to get channel username or id")
+                return
+            
+            logger.info(f"{self.session_name} | Retrieved channel: <y>{chat_username}</y>")
             try:
-                chat = await self.tg_client.join_chat(parsed_link)
-                logger.info(f"{self.session_name} | Successfully joined chat <y>{chat.title}</y>")
-            except Exception as join_error:
-                if "USER_ALREADY_PARTICIPANT" in str(join_error):
-                    logger.info(f"{self.session_name} | Already a member of the chat: {link}")
-                    chat = await self.tg_client.get_chat(parsed_link)
+                await self.tg_client.get_chat_member(chat_username, "me")
+            except Exception as error:
+                if error.ID == 'USER_NOT_PARTICIPANT':
+                    await asyncio.sleep(delay=3)
+                    chat = await self.tg_client.join_chat(parsed_link)
+                    chat_id = chat.id
+                    logger.info(f"{self.session_name} | Successfully joined chat <y>{chat_username}</y>")
+                    await asyncio.sleep(random.randint(5, 10))
+                    peer = await self.tg_client.resolve_peer(chat_id)
+                    await self.tg_client.invoke(account.UpdateNotifySettings(
+                        peer=InputNotifyPeer(peer=peer),
+                        settings=InputPeerNotifySettings(mute_until=2147483647)
+                    ))
+                    logger.info(f"{self.session_name} | Successfully muted chat <y>{chat_username}</y>")
                 else:
-                    
-                    raise join_error
-
-            chat_id = chat.id
-            chat_title = getattr(chat, 'title', link)
-
-            await asyncio.sleep(random.randint(5, 10))
-
-            peer = await self.tg_client.resolve_peer(chat_id)
-            await self.tg_client.invoke(account.UpdateNotifySettings(
-                peer=InputNotifyPeer(peer=peer),
-                settings=InputPeerNotifySettings(mute_until=2147483647)
-            ))
-            logger.info(f"{self.session_name} | Successfully muted chat <y>{chat_title}</y>")
-
+                    logger.error(f"{self.session_name} | Error while checking channel: <y>{chat_username}</y>: {str(error.ID)}")
         except Exception as e:
             logger.error(f"{self.session_name} | Error joining/muting channel {link}: {str(e)}")
-
+            await asyncio.sleep(delay=3)    
         finally:
             if self.tg_client.is_connected:
                 await self.tg_client.disconnect()
-
-        await asyncio.sleep(random.randint(10, 20))
-
+            await asyncio.sleep(random.randint(10, 20))
     
     @error_handler
     async def make_request(self, http_client, method, endpoint=None, url=None, **kwargs):
@@ -229,28 +243,52 @@ class Tapper:
         return detail.get('rating') if detail else 0
     
     @error_handler
-    async def join_squad(self, http_client):
-        return await self.make_request(http_client, 'POST', endpoint="/squads/2237841784/join/?")
+    async def leave_squad(self, http_client):
+        return await self.make_request(http_client, 'POST', endpoint=f"/squads/leave/?")
+    
+    @error_handler
+    async def join_squad(self, http_client, squad_id):
+        return await self.make_request(http_client, 'POST', endpoint=f"/squads/{squad_id}/join/?")
     
     @error_handler
     async def get_squad(self, http_client, squad_id):
         return await self.make_request(http_client, 'GET', endpoint=f"/squads/{squad_id}?")
     
     @error_handler
-    async def puvel_puzzle(self, http_client):
-        
+    async def youtube_answers(self, http_client, task_id, task_title):
         async with aiohttp.ClientSession() as session:
             async with session.get("https://raw.githubusercontent.com/GravelFire/TWFqb3JCb3RQdXp6bGVEdXJvdg/master/answer.py") as response:
                 status = response.status
                 if status == 200:
-                    response_answer = json.loads(await response.text())
-                    if response_answer.get('expires', 0) > int(time.time()):
-                        answer = response_answer.get('answer')
-                        start = await self.make_request(http_client, 'GET', endpoint="/durov/")
-                        if start and start.get('success', False):
-                            logger.info(f"{self.session_name} | Start game <y>Puzzle</y>")
-                            await asyncio.sleep(3)
-                            return await self.make_request(http_client, 'POST', endpoint="/durov/", json=answer)
+                    response_data = json.loads(await response.text())
+                    youtube_answers = response_data.get('youtube', {})
+                    if task_title in youtube_answers:
+                        answer = youtube_answers[task_title]
+                        payload = {
+                            "task_id": task_id,
+                            "payload": {
+                                "code": answer
+                            }
+                        }
+                        logger.info(f"{self.session_name} | Attempting YouTube task: <y>{task_title}</y>")
+                        response = await self.make_request(http_client, 'POST', endpoint="/tasks/", json=payload)
+                        if response and response.get('is_completed') is True:
+                            logger.info(f"{self.session_name} | Completed YouTube task: <y>{task_title}</y>")
+                            return True
+        return False
+    
+    
+    @error_handler
+    async def puvel_puzzle(self, http_client):
+        global global_answers
+        
+        if global_answers.get('expires', 0) > int(time.time()):
+            answer = global_answers.get('answer')
+            start = await self.make_request(http_client, 'GET', endpoint="/durov/")
+            if start and start.get('success', False):
+                logger.info(f"{self.session_name} | Start game <y>Puzzle</y>")
+                await asyncio.sleep(random.randint(5, 7))
+                return await self.make_request(http_client, 'POST', endpoint="/durov/", json=answer)
         return None
 
     @error_handler
@@ -280,9 +318,12 @@ class Tapper:
                     
         if self.proxy:
             await self.check_proxy(http_client=http_client)
-            
+        
+        fake_user_agent = generate_random_user_agent(device_type='android', browser_type='chrome')
+        
+        
         if settings.FAKE_USERAGENT:            
-            http_client.headers['User-Agent'] = generate_random_user_agent(device_type='android', browser_type='chrome')
+            http_client.headers['User-Agent'] = fake_user_agent
         
         while True:
             try:
@@ -294,7 +335,7 @@ class Tapper:
                     proxy_conn = ProxyConnector().from_url(self.proxy) if self.proxy else None
                     http_client = aiohttp.ClientSession(headers=headers, connector=proxy_conn)
                     if settings.FAKE_USERAGENT:            
-                        http_client.headers['User-Agent'] = generate_random_user_agent(device_type='android', browser_type='chrome')
+                        http_client.headers['User-Agent'] = fake_user_agent
                 
                 user_data = await self.login(http_client=http_client, init_data=init_data, ref_id=ref_id)
                 if not user_data:
@@ -310,11 +351,21 @@ class Tapper:
                 rating = await self.get_detail(http_client=http_client)
                 logger.info(f"{self.session_name} | ID: <y>{user.get('id')}</y> | Points : <y>{rating}</y>")
                 
-                if squad_id is None:
-                    await self.join_squad(http_client=http_client)
-                    squad_id = "2237841784"
-                    await asyncio.sleep(1)
+                
+                if settings.SQUAD_ID and squad_id is None:
+                    await self.join_squad(http_client=http_client, squad_id=settings.SQUAD_ID)
+                    squad_id = settings.SQUAD_ID
+                    await asyncio.sleep(random.randint(1, 3))
+                
+                if settings.SQUAD_ID and squad_id != settings.SQUAD_ID:
+                    await self.leave_squad(http_client=http_client)
+                    await asyncio.sleep(random.randint(5, 7))
+                    await self.join_squad(http_client=http_client, squad_id=settings.SQUAD_ID)
+                    squad_id = settings.SQUAD_ID
+                    await asyncio.sleep(random.randint(1, 3))
                     
+                    
+                logger.info(f"{self.session_name} | Squad ID: <y>{squad_id}</y>")
                 data_squad = await self.get_squad(http_client=http_client, squad_id=squad_id)
                 if data_squad:
                     logger.info(f"{self.session_name} | Squad : <y>{data_squad.get('name')}</y> | Member : <y>{data_squad.get('members_count')}</y> | Ratings : <y>{data_squad.get('rating')}</y>")    
@@ -324,64 +375,69 @@ class Tapper:
                     await asyncio.sleep(1)
                     logger.info(f"{self.session_name} | Daily Streak : <y>{data_visit.get('streak')}</y>")
                 
+                await asyncio.sleep(random.randint(1, 3))
                 await self.streak(http_client=http_client)
                 
                 
-                hold_coins = await self.claim_hold_coins(http_client=http_client)
-                if hold_coins:
-                    await asyncio.sleep(1)
-                    logger.info(f"{self.session_name} | Reward HoldCoins: <y>+{hold_coins}⭐</y>")
-                await asyncio.sleep(10)
+                tasks = [
+                    ('HoldCoins', self.claim_hold_coins),
+                    ('SwipeCoins', self.claim_swipe_coins),
+                    ('Roulette', self.claim_roulette),
+                    ('Puzzle', self.puvel_puzzle),
+                    ('d_tasks', self.get_daily),
+                    ('m_tasks', self.get_tasks)
+                ]
                 
+                random.shuffle(tasks)
                 
-                swipe_coins = await self.claim_swipe_coins(http_client=http_client)
-                if swipe_coins:
-                    await asyncio.sleep(1)
-                    logger.info(f"{self.session_name} | Reward SwipeCoins: <y>+{swipe_coins}⭐</y>")
-                await asyncio.sleep(10)
-                
-                
-                roulette = await self.claim_roulette(http_client=http_client)
-                if roulette:
-                    await asyncio.sleep(1)
-                    logger.info(f"{self.session_name} | Reward Roulette : <y>+{roulette}⭐</y>")
-                await asyncio.sleep(10)
-                
-                puzzle = await self.puvel_puzzle(http_client=http_client)
-                if puzzle:
-                    await asyncio.sleep(1)
-                    logger.info(f"{self.session_name} | Reward Puzzle Pavel: <y>+5000⭐</y>")
-                await asyncio.sleep(10)
-                
-                
-                data_daily = await self.get_daily(http_client=http_client)
-                if data_daily:
-                    for daily in reversed(data_daily):
-                        await asyncio.sleep(10)
-                        id = daily.get('id')
-                        title = daily.get('title')
-                        #if title not in ["Donate rating", "Boost Major channel", "TON Transaction"]:
-                        data_done = await self.done_tasks(http_client=http_client, task_id=id)
-                        if data_done and data_done.get('is_completed') is True:
-                            await asyncio.sleep(1)
-                            logger.info(f"{self.session_name} | Daily Task : <y>{daily.get('title')}</y> | Reward : <y>{daily.get('award')}</y>")
-                
-                data_task = await self.get_tasks(http_client=http_client)
-                if data_task:
-                    for task in data_task:
-                        await asyncio.sleep(10)
-                        id = task.get('id')
-                        if task.get('type') == 'subscribe_channel':
-                            if not settings.TASKS_WITH_JOIN_CHANNEL:
-                                continue
-                            await self.join_and_mute_tg_channel(link=task.get('payload').get('url'))
-                            await asyncio.sleep(5)
-                        
-                        data_done = await self.done_tasks(http_client=http_client, task_id=id)
-                        if data_done and data_done.get('is_completed') is True:
-                            await asyncio.sleep(1)
-                
-                            logger.info(f"{self.session_name} | Task : <y>{task.get('title')}</y> | Reward : <y>{task.get('award')}</y>")
+                for task_name, task_func in tasks:
+                    await asyncio.sleep(random.randint(5, 10))
+                    #logger.info(f"{self.session_name} | Task <y>{task_name}</y>")
+                    
+                    # Игрушки в Major, выполняются раз в 8 часов или если перейдут по рефералке 10 пользователей
+                    if task_name in ['HoldCoins', 'SwipeCoins', 'Roulette', 'Puzzle']:
+                        result = await task_func(http_client=http_client)
+                        if result:
+                            await asyncio.sleep(random.randint(1, 3))
+                            reward = "+5000⭐" if task_name == 'Puzzle' else f"+{result}⭐"
+                            logger.info(f"{self.session_name} | Reward {task_name}: <y>{reward}</y>")
+                    
+                    # Ежедневные задания, которые можно выполнять каждый день
+                    elif task_name == 'd_tasks':
+                        data_daily = await task_func(http_client=http_client)
+                        if data_daily:
+                            random.shuffle(data_daily)
+                            for daily in data_daily:
+                                await asyncio.sleep(random.randint(5, 10))
+                                id = daily.get('id')
+                                title = daily.get('title')
+                                data_done = await self.done_tasks(http_client=http_client, task_id=id)
+                                if data_done and data_done.get('is_completed') is True:
+                                    logger.info(f"{self.session_name} | Daily Task : <y>{daily.get('title')}</y> | Reward : <y>{daily.get('award')}</y>")
+                    
+                    # Основные задания, которые одноразово выполняются
+                    elif task_name == 'm_tasks':
+                        data_task = await task_func(http_client=http_client)
+                        if data_task:
+                            random.shuffle(data_task)
+                            for task in data_task:
+                                await asyncio.sleep(random.randint(5, 10))
+                                id = task.get('id')
+                                title = task.get("title", "")
+                                if task.get("type") == "code":
+                                    await self.youtube_answers(http_client=http_client, task_id=id, task_title=title)
+                                    continue
+                                
+                                if task.get('type') == 'subscribe_channel' or re.findall(r'(Join|Subscribe|Follow).*?channel', title, re.IGNORECASE):
+                                    if not settings.TASKS_WITH_JOIN_CHANNEL:
+                                        continue
+                                    await self.join_and_mute_tg_channel(link=task.get('payload').get('url'))
+                                    await asyncio.sleep(random.randint(5, 10))
+                                
+                                data_done = await self.done_tasks(http_client=http_client, task_id=id)
+                                if data_done and data_done.get('is_completed') is True:
+                                    logger.info(f"{self.session_name} | Task : <y>{title}</y> | Reward : <y>{task.get('award')}</y>")
+                    
                 await http_client.close()
                 if proxy_conn:
                     if not proxy_conn.closed:
